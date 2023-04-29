@@ -22,3 +22,6 @@ controller is able to demonstrate the capabilities of the bi-axial tilting platf
 
 ## **Trajectory tracking**
 ![Roll20_traj](https://user-images.githubusercontent.com/58835285/235308267-05ea2ea2-915f-4ef7-882a-4a7fdd11a1f3.png)
+
+## **Wind resistance (with arbitrary attitude)**
+![Roll20_wind_hover](https://user-images.githubusercontent.com/58835285/235308445-785cd548-087e-4ac7-b016-7b0f639a4192.png)
