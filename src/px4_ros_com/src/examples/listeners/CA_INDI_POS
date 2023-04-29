@@ -1,0 +1,715 @@
+/*>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>  QUADPLUS: OVERACTUATED MULTIROTOR  >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+				
+#### This file contains the source code for INDI control allocation to achieve position control
+
+# INPUT:: Body frame- Incremental Forces and Moments (del_F_M_b), 
+		       Each Propeller force in local x,y,z axes (F_P).
+# OUTPUT:: Servo angles (u),
+	   Kill switch (rc_ks).
+# RUNNING FREQUENCY:: 1000 Hz.
+
+**Note- Coordinate convention used is FLU (Front-Left-Up) using Right-hand rule.
+		       
+<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<*/
+
+#include <memory>
+#include <chrono>
+#include <deque>
+
+using namespace std::chrono_literals;
+
+#include <rclcpp/rclcpp.hpp>
+#include <px4_msgs/msg/vehicle_local_position.hpp>
+#include <geometry_msgs/msg/pose_array.hpp>
+#include <geometry_msgs/msg/twist.hpp>
+
+#include </usr/include/armadillo>
+
+// Declaration
+arma::vec F_P = arma::zeros(12);
+double rc_ks;
+uint64_t timestamp;
+int i,j;
+
+arma::vec u = arma::zeros(8);					// absolute actuator output
+arma::vec u_prev = arma::zeros(8);				// actuator output at previous time step
+arma::vec delu_res = arma::zeros(8);				// restoring delta u to deal with path dependency
+arma::vec delu_res_prev = arma::zeros(8);			// restoring delta u at previous time step
+arma::vec delu_r = arma::zeros(8);				// total delta u output (including restoring)
+arma::vec delu_out = arma::zeros(8);				// total delta u output (excluding restoring)
+arma::vec del_F_M_b = arma::zeros(6);				// desired delta pseudo control
+double u_0[12] = {0.0};					// absolute actuator output at previous time step (derived from reference generation)
+double T1_0 = 0.0, T2_0 = 0.0, T3_0 = 0.0, T4_0 = 0.0;	// commanded thrust values at previous time step				
+double M_idx_0;						// drag moments (reused in the code as index)
+double M_idx_1;
+double M_idx_2;
+double M_idx_3;
+arma::mat B = arma::zeros(6,8);  // or B.zeros(6, 8)
+arma::mat W_inv = arma::zeros(8,8);
+
+
+// declare constants
+double KT = 2.5E-5;						// coefficient of thrust
+double KM = 4.0E-7;						// coefficient of drag moment
+double co_ratio = KM / KT;		
+double l3 = 0.075;						// displacement from bottom centre of rotation to top centre of rotation
+double hb = -0.0066;						// displacement of bottom centre of rotation from CG
+arma::vec la = {-0.265,0.265,0.265,-0.265};			// arm length vector
+double error_lim = 1.0E-8;
+
+
+// define control output limits
+/*arma::vec alpha_min = {-arma::datum::pi/18.0, -arma::datum::pi/2.0, -arma::datum::pi/2.0, -arma::datum::pi/2.0};
+arma::vec alpha_max = {arma::datum::pi/2.0, arma::datum::pi/18.0, arma::datum::pi/2.0, arma::datum::pi/2.0};
+arma::vec beta_min = {-arma::datum::pi/2.0, -arma::datum::pi/2.0, -arma::datum::pi/18.0, -arma::datum::pi/2.0};
+arma::vec beta_max = {arma::datum::pi/2.0, arma::datum::pi/2.0, arma::datum::pi/2.0, arma::datum::pi/18.0};*/
+arma::vec alpha_min = {-arma::datum::pi/7.2, -arma::datum::pi/2.5, -arma::datum::pi/2.5, -arma::datum::pi/2.5};
+arma::vec alpha_max = {arma::datum::pi/2.5, arma::datum::pi/7.2, arma::datum::pi/2.5, arma::datum::pi/2.5};
+arma::vec beta_min = {-arma::datum::pi/2.5, -arma::datum::pi/2.5, -arma::datum::pi/7.2, -arma::datum::pi/2.5};
+arma::vec beta_max = {arma::datum::pi/2.5, arma::datum::pi/2.5, arma::datum::pi/2.5, arma::datum::pi/7.2};
+arma::vec u_min = arma::join_cols(alpha_min,beta_min);
+arma::vec u_max = arma::join_cols(alpha_max,beta_max);
+
+arma::vec alpha_ref = arma::zeros(4);
+arma::vec beta_ref = arma::zeros(4);
+arma::vec omega_ref = arma::zeros(4);
+
+// double ended queue to compute rolling average (do not use std::deque<deque<double>> as it increases computational time)
+std::deque<double> delu_r_0 {0.0,0.0,0.0};
+std::deque<double> delu_r_1 {0.0,0.0,0.0};
+std::deque<double> delu_r_2 {0.0,0.0,0.0};
+std::deque<double> delu_r_3 {0.0,0.0,0.0};
+std::deque<double> delu_r_4 {0.0,0.0,0.0};
+std::deque<double> delu_r_5 {0.0,0.0,0.0};
+std::deque<double> delu_r_6 {0.0,0.0,0.0};
+std::deque<double> delu_r_7 {0.0,0.0,0.0};
+
+double delu_r_avg0, delu_r_avg1, delu_r_avg2, delu_r_avg3, delu_r_avg4, delu_r_avg5, delu_r_avg6, delu_r_avg7;
+
+//@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+//@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@    NODE: OUTPUT ADV   @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+//@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+class OutputAdvertiser : public rclcpp::Node
+{
+public:
+	OutputAdvertiser() : Node("output_advertiser") {
+	
+	// Subscriber 1
+		force_vect_listener_ = this->create_subscription<geometry_msgs::msg::PoseArray>("/pos_forces",
+		#ifdef ROS_DEFAULT_API
+            	10,
+		#endif
+            	[this](const geometry_msgs::msg::PoseArray::UniquePtr msg) {
+		    	del_F_M_b(0) = msg->poses[0].position.x;
+		    	del_F_M_b(1) = msg->poses[0].position.y;
+		    	del_F_M_b(2) = msg->poses[0].position.z;
+		       
+		    	del_F_M_b(3) = msg->poses[0].orientation.x;
+		    	del_F_M_b(4) = msg->poses[0].orientation.y;
+		    	del_F_M_b(5) = msg->poses[0].orientation.z;
+		    	
+		    	F_P(0) = msg->poses[1].position.x;
+		    	F_P(1) = msg->poses[1].position.y;
+		    	F_P(2) = msg->poses[1].position.z;
+		    	
+		    	F_P(3) = msg->poses[1].orientation.x;
+		    	F_P(4) = msg->poses[1].orientation.y;
+		    	F_P(5) = msg->poses[1].orientation.z;
+		    	
+		    	F_P(6) = msg->poses[2].position.x;
+		    	F_P(7) = msg->poses[2].position.y;
+		    	F_P(8) = msg->poses[2].position.z;
+		    	
+		    	F_P(9) = msg->poses[2].orientation.x;
+		    	F_P(10) = msg->poses[2].orientation.y;
+		    	F_P(11) = msg->poses[2].orientation.z;
+		    	
+		    	T1_0 = msg->poses[3].position.x;
+			    T2_0 = msg->poses[3].position.y;
+			    T3_0 = msg->poses[3].position.z;
+			    T4_0 = msg->poses[3].orientation.x;
+		    	
+		    	rc_ks = msg->poses[3].orientation.y;
+		    	timestamp = msg->poses[3].orientation.z;
+           	});
+           	
+        // Publisher
+#ifdef ROS_DEFAULT_API
+		output_publisher_ = this->create_publisher<geometry_msgs::msg::PoseArray>("/servo_angles", 10);
+#else
+		output_publisher_ = this->create_publisher<geometry_msgs::msg::PoseArray>("/servo_angles");
+#endif
+	    	auto timer_callback =
+		[this]()->void {
+			control_allocation();
+		}; // closing timer_callback
+		timer_ = this->create_wall_timer(2ms, timer_callback);
+	} // closing public constructor
+	
+	void control_allocation();
+
+private:
+	rclcpp::TimerBase::SharedPtr timer_;
+	rclcpp::Publisher<geometry_msgs::msg::PoseArray>::SharedPtr output_publisher_;		    // Publisher
+	rclcpp::Subscription<geometry_msgs::msg::PoseArray>::SharedPtr force_vect_listener_;	// Subscriber 1
+};
+
+//@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+//@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@    FUNCTION: INDI CONTROL ALLOCATION   @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+//@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+void OutputAdvertiser::control_allocation() {
+	// Initialize and resize message type variable
+		auto angles_vect = geometry_msgs::msg::PoseArray();
+		angles_vect.poses.resize(2);
+			/*std::cout << "INDI script values " << std::endl;
+		        std::cout << "==================" << std::endl;
+		        std::cout << "del_F_M_b(0): " << del_F_M_b(0)  << std::endl;
+		        std::cout << "del_F_M_b(1): " << del_F_M_b(1)  << std::endl;
+		        std::cout << "del_F_M_b(2): " << del_F_M_b(2)  << std::endl;
+		        std::cout << "del_F_M_b(3): " << del_F_M_b(3)  << std::endl;
+		        std::cout << "del_F_M_b(4): " << del_F_M_b(4)  << std::endl;
+		        std::cout << "del_F_M_b(5): " << del_F_M_b(5)  << std::endl;
+		        std::cout << "F_P(0): " << F_P(0)  << std::endl;
+		        std::cout << "F_P(1): " << F_P(1)  << std::endl;
+		        std::cout << "F_P(2): " << F_P(2)  << std::endl;
+		        std::cout << "F_P(3): " << F_P(3)  << std::endl;
+		        std::cout << "F_P(4): " << F_P(4)  << std::endl;
+		        std::cout << "F_P(5): " << F_P(5)  << std::endl;
+		        std::cout << "F_P(6): " << F_P(6)  << std::endl;
+		        std::cout << "F_P(7): " << F_P(7)  << std::endl;
+		        std::cout << "F_P(8): " << F_P(8)  << std::endl;
+		        std::cout << "F_P(9): " << F_P(9)  << std::endl;
+		        std::cout << "F_P(10): " << F_P(10)  << std::endl;
+		        std::cout << "F_P(11): " << F_P(11)  << std::endl;*/
+		        
+// @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@  Reference Generation  @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+       				
+	// alpha and beta reference generation using system dynamic equations
+		for (i = 0; i < 2; i++) {
+			j = i + (2 * i);  // to take a jump of 3 elements in every iteration for F_P(F_x, F_y, F_z)
+			if (F_P(j + 1) == 0 && F_P(j + 2) == 0) {
+			      alpha_ref(i) = 0;}
+			else {
+			      alpha_ref(i) = atan(-F_P(j + 1)/F_P(j + 2));}
+			if (F_P(j) == 0 && F_P(j + 1) == 0 && F_P(j + 2) == 0) {
+			      beta_ref(i) = 0;}
+			else {
+			      beta_ref(i) = atan(F_P(j)/(sqrt((F_P(j + 1)*F_P(j + 1)) + (F_P(j + 2)*F_P(j + 2)))));}
+			      
+			omega_ref(i) = sqrt((sqrt(F_P(j)*F_P(j) + F_P(j + 1)*F_P(j + 1) + F_P(j + 2)*F_P(j + 2)))/KT);
+		}
+		for (i = 2; i < 4; i++) {
+			j = i + (2 * i);  // to take a jump of 3 elements in every iteration for F_P(F_x, F_y, F_z)
+			if (F_P(j + 1) == 0 && F_P(j) == 0 && F_P(j + 2) == 0) {
+			      alpha_ref(i) = 0;}
+			else {
+			      alpha_ref(i) = atan(-F_P(j + 1) / (sqrt((F_P(j)*F_P(j)) + (F_P(j + 2)*F_P(j + 2)))));}
+			if (F_P(j) == 0 && F_P(j + 2) == 0) {
+			      beta_ref(i) = 0;}
+			else {
+			      beta_ref(i) = atan(F_P(j) / F_P(j + 2));} 
+			      
+			omega_ref(i) = sqrt((sqrt(F_P(j)*F_P(j) + F_P(j + 1)*F_P(j + 1) + F_P(j + 2)*F_P(j + 2))) / KT);
+		}
+				
+		/*std::cout << "alpha_ref: " << alpha_ref  << std::endl;
+		std::cout << "beta_ref: " << beta_ref  << std::endl;
+		std::cout << "omega_ref: " << omega_ref  << std::endl;*/
+				
+// @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@  Control Allocation  @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+	// thrust generated by propellers
+	    int idx;
+	    u_0[0] = T1_0;
+		u_0[1] = T2_0;
+		u_0[2] = T3_0;
+		u_0[3] = T4_0;
+		/*u_0[0] = KT*omega_ref(0)*omega_ref(0);
+		u_0[1] = KT*omega_ref(1)*omega_ref(1);
+		u_0[2] = KT*omega_ref(2)*omega_ref(2);
+		u_0[3] = KT*omega_ref(3)*omega_ref(3);*/
+	//  drag moment of propellers
+		M_idx_0 = -co_ratio*u_0[0];					// CHANGE: negative sign for CCW rotation of drag moment about positive Z-axis (up)
+		M_idx_1 = -co_ratio*u_0[1];					// CHANGE: negative sign for CCW rotation of drag moment about positive Z-axis (up)
+		M_idx_2 = co_ratio*u_0[2];
+		M_idx_3 = co_ratio*u_0[3];
+	// declaring u_0 to compute u = u_0 + delu_out
+		u_0[4] = alpha_ref(0);
+		u_0[5] = alpha_ref(1);
+		u_0[6] = alpha_ref(2);
+		u_0[7] = alpha_ref(3);
+		u_0[8] = beta_ref(0);
+		u_0[9] = beta_ref(1);
+		u_0[10] = beta_ref(2);
+		u_0[11] = beta_ref(3);
+	// determine cos and sin of reference servo angles
+		double c_a0 = std::cos(u_0[4]);
+		double c_a1 = std::cos(u_0[5]);
+		double c_a2 = std::cos(u_0[6]);
+		double c_a3 = std::cos(u_0[7]);
+		double s_a0 = std::sin(u_0[4]);
+		double s_a1 = std::sin(u_0[5]);
+		double s_a2 = std::sin(u_0[6]);
+		double s_a3 = std::sin(u_0[7]);
+
+		double c_b0 = std::cos(u_0[8]);
+		double c_b1 = std::cos(u_0[9]);
+		double c_b2 = std::cos(u_0[10]);
+		double c_b3 = std::cos(u_0[11]);
+		double s_b0 = std::sin(u_0[8]);
+		double s_b1 = std::sin(u_0[9]);
+		double s_b2 = std::sin(u_0[10]);
+		double s_b3 = std::sin(u_0[11]);
+			
+	// define the input matrix
+		B(0,0) = 0.0;
+		B(0,1) = 0.0;
+		B(0,2) = -u_0[2] * s_a2 * s_b2;
+		B(0,3) = -u_0[3] * s_a3 * s_b3;
+		B(0,4) = u_0[0] * c_b0;
+		B(0,5) = u_0[1] * c_b1;
+		B(0,6) = u_0[2] * c_a2 * c_b2;
+		B(0,7) = u_0[3] * c_a3 * c_b3;
+
+		B(1,0) = -u_0[0] * c_a0 * c_b0;
+		B(1,1) = -u_0[1] * c_a1 * c_b1;
+		B(1,2) = -u_0[2] * c_a2;
+		B(1,3) = -u_0[3] * c_a3;
+		B(1,4) = u_0[0] * s_a0 * s_b0;
+		B(1,5) = u_0[1] * s_a1 * s_b1;
+		B(1,6) = 0.0;
+		B(1,7) = 0.0;
+					
+		B(2,0) = -u_0[0] * s_a0 * c_b0;
+		B(2,1) = -u_0[1] * s_a1 * c_b1;
+		B(2,2) = -u_0[2] * s_a2 * c_b2;
+		B(2,3) = -u_0[3] * s_a3 * c_b3;
+		B(2,4) = -u_0[0] * c_a0 * s_b0;
+		B(2,5) = -u_0[1] * c_a1 * s_b1;
+		B(2,6) = -u_0[2] * c_a2 * s_b2;
+		B(2,7) = -u_0[3] * c_a3 * s_b3;
+
+		B(3,0) = (-la(0) * s_a0 + hb * c_a0)*u_0[0] * c_b0;
+		B(3,1) = (-la(1) * s_a1 + hb * c_a1)*u_0[1] * c_b1;
+		B(3,2) = (l3 * c_b2 + hb) * u_0[2]* c_a2 - (M_idx_2 * s_a2 * s_b2);
+		B(3,3) = (l3 * c_b3 + hb) * u_0[3]* c_a3 - (M_idx_3 * s_a3 * s_b3);
+		B(3,4) = (-la(0) * c_a0 - hb * s_a0) * u_0[0] * s_b0 - (M_idx_0 * c_b0);
+		B(3,5) = (-la(1) * c_a1 - hb * s_a1) * u_0[1] * s_b1 - (M_idx_1 * c_b1);
+		B(3,6) = -u_0[2] * l3 * s_a2 * s_b2 + (M_idx_2 * c_a2 * c_b2);
+		B(3,7) = -u_0[3] * l3 * s_a3 * s_b3 + (M_idx_3 * c_a3 * c_b3);
+
+		B(4,0) = -u_0[0] * l3 * s_a0 * s_b0 + (M_idx_0 * c_a0 * c_b0);
+		B(4,1) = -u_0[1] * l3 * s_a1 * s_b1 + (M_idx_1 * c_a1 * c_b1);
+		B(4,2) = (la(2) * c_b2 - hb * s_b2) * u_0[2] * s_a2 - (M_idx_2 * c_a2);
+		B(4,3) = (la(3) * c_b3 - hb * s_b3) * u_0[3] * s_a3 - (M_idx_3 * c_a3);
+		B(4,4) = (l3 * c_a0 + hb) *u_0[0] * c_b0 - (M_idx_0 * s_a0 * s_b0);
+		B(4,5) = (l3 * c_a1 + hb) * u_0[1] * c_b1 - (M_idx_1 * s_a1 * s_b1);
+		B(4,6) = (la(2) * s_b2 + hb * c_b2) * u_0[2] * c_a2;
+		B(4,7) = (la(3) * s_b3 + hb * c_b3) * u_0[3] * c_a3;
+
+		B(5,0) = u_0[0] * l3 * c_a0 * s_b0 - (M_idx_0 * s_a0 * c_b0);			// CHANGE: negative sign for drag moment (as sign is handled during computation)
+		B(5,1) = u_0[1] * l3 * c_a1 * s_b1 - (M_idx_1 * s_a1 * c_b1);			// CHANGE: negative sign for drag moment (as sign is handled during computation)
+		B(5,2) = (-l3 * s_b2 - la(2)) * u_0[2] * c_a2 - (M_idx_2 * s_a2 * c_b2);
+		B(5,3) = (-l3 * s_b3 - la(3)) * u_0[3] * c_a3 - (M_idx_3 * s_a3 * c_b3);
+		B(5,4) = (l3 * s_a0 - la(0)) * u_0[0] * c_b0 - (M_idx_0 * c_a0 * s_b0);		// CHANGE: negative sign for drag moment (as sign is handled during computation)
+		B(5,5) = (l3 * s_a1 - la(1)) * u_0[1] * c_b1 - (M_idx_1 * c_a1 * s_b1);		// CHANGE: negative sign for drag moment (as sign is handled during computation)
+		B(5,6) = -u_0[2] * l3 * s_a2 * c_b2 - (M_idx_2 * c_a2 * s_b2);
+		B(5,7) = -u_0[3] * l3 * s_a3 * c_b3 - (M_idx_3 * c_a3 * s_b3);
+		//std::cout << "B: " << B << std::endl;
+		
+		arma::mat B_norm = arma::zeros(6,8);;
+		B_norm(0,0) = 0.0;
+		B_norm(0,1) = 0.0;
+		B_norm(0,2) = (-u_0[2] * s_a2 * s_b2) * (alpha_max(2) - alpha_min(2));
+		B_norm(0,3) = (-u_0[3] * s_a3 * s_b3) * (alpha_max(3) - alpha_min(3));
+		B_norm(0,4) = (u_0[0] * c_b0) * (beta_max(0) - beta_min(0));
+		B_norm(0,5) = (u_0[1] * c_b1) * (beta_max(1) - beta_min(1));
+		B_norm(0,6) = (u_0[2] * c_a2 * c_b2) * (beta_max(2) - beta_min(2));
+		B_norm(0,7) = (u_0[3] * c_a3 * c_b3) * (beta_max(3) - beta_min(3));
+
+		B_norm(1,0) = -u_0[0] * c_a0 * c_b0 * (alpha_max(0) - alpha_min(0));
+		B_norm(1,1) = (-u_0[1] * c_a1 * c_b1) * (alpha_max(1) - alpha_min(1));
+		B_norm(1,2) = (-u_0[2] * c_a2) * (alpha_max(2) - alpha_min(2));
+		B_norm(1,3) = (-u_0[3] * c_a3) * (alpha_max(3) - alpha_min(3));
+		B_norm(1,4) = (u_0[0] * s_a0 * s_b0) * (beta_max(0) - beta_min(0));
+		B_norm(1,5) = (u_0[1] * s_a1 * s_b1) * (beta_max(1) - beta_min(1));
+		B_norm(1,6) = 0.0;
+		B_norm(1,7) = 0.0;
+						
+		B_norm(2,0) = (-u_0[0] * s_a0 * c_b0) * (alpha_max(0) - alpha_min(0));
+		B_norm(2,1) = (-u_0[1] * s_a1 * c_b1) * (alpha_max(1) - alpha_min(1));
+		B_norm(2,2) = (-u_0[2] * s_a2 * c_b2) * (alpha_max(2) - alpha_min(2));
+		B_norm(2,3) = (-u_0[3] * s_a3 * c_b3) * (alpha_max(3) - alpha_min(3));
+		B_norm(2,4) = (-u_0[0] * c_a0 * s_b0) * (beta_max(0) - beta_min(0));
+		B_norm(2,5) = (-u_0[1] * c_a1 * s_b1) * (beta_max(1) - beta_min(1));
+		B_norm(2,6) = (-u_0[2] * c_a2 * s_b2) * (beta_max(2) - beta_min(2));
+		B_norm(2,7) = (-u_0[3] * c_a3 * s_b3) * (beta_max(3) - beta_min(3));
+
+		B_norm(3,0) = ((-la(0) * s_a0 + hb * c_a0)*u_0[0] * c_b0) * (alpha_max(0) - alpha_min(0));
+		B_norm(3,1) = ((-la(1) * s_a1 + hb * c_a1)*u_0[1] * c_b1) * (alpha_max(1) - alpha_min(1));
+		B_norm(3,2) = ((l3 * c_b2 + hb) * u_0[2]* c_a2 - (M_idx_2 * s_a2 * s_b2)) * (alpha_max(2) - alpha_min(2));
+		B_norm(3,3) = ((l3 * c_b3 + hb) * u_0[3]* c_a3 - (M_idx_3 * s_a3 * s_b3)) * (alpha_max(3) - alpha_min(3));
+		B_norm(3,4) = ((-la(0) * c_a0 - hb * s_a0) * u_0[0] * s_b0 - (M_idx_0 * c_b0)) * (beta_max(0) - beta_min(0));
+		B_norm(3,5) = ((-la(1) * c_a1 - hb * s_a1) * u_0[1] * s_b1 - (M_idx_1 * c_b1)) * (beta_max(1) - beta_min(1));
+		B_norm(3,6) = (-u_0[2] * l3 * s_a2 * s_b2 + (M_idx_2 * c_a2 * c_b2)) * (beta_max(2) - beta_min(2));
+		B_norm(3,7) = (-u_0[3] * l3 * s_a3 * s_b3 + (M_idx_3 * c_a3 * c_b3)) * (beta_max(3) - beta_min(3));
+
+		B_norm(4,0) = (-u_0[0] * l3 * s_a0 * s_b0 + (M_idx_0 * c_a0 * c_b0)) * (alpha_max(0) - alpha_min(0));
+		B_norm(4,1) = (-u_0[1] * l3 * s_a1 * s_b1 + (M_idx_1 * c_a1 * c_b1)) * (alpha_max(1) - alpha_min(1));
+		B_norm(4,2) = ((la(2) * c_b2 - hb * s_b2) * u_0[2] * s_a2 - (M_idx_2 * c_a2)) * (alpha_max(2) - alpha_min(2));
+		B_norm(4,3) = ((la(3) * c_b3 - hb * s_b3) * u_0[3] * s_a3 - (M_idx_3 * c_a3)) * (alpha_max(3) - alpha_min(3));
+		B_norm(4,4) = ((l3 * c_a0 + hb) *u_0[0] * c_b0 - (M_idx_0 * s_a0 * s_b0)) * (beta_max(0) - beta_min(0));
+		B_norm(4,5) = ((l3 * c_a1 + hb) * u_0[1] * c_b1 - (M_idx_1 * s_a1 * s_b1)) * (beta_max(1) - beta_min(1));
+		B_norm(4,6) = ((la(2) * s_b2 + hb * c_b2) * u_0[2] * c_a2) * (beta_max(2) - beta_min(2));
+		B_norm(4,7) = ((la(3) * s_b3 + hb * c_b3) * u_0[3] * c_a3) * (beta_max(3) - beta_min(3));
+
+		B_norm(5,0) = (u_0[0] * l3 * c_a0 * s_b0 - (M_idx_0 * s_a0 * c_b0)) * (alpha_max(0) - alpha_min(0)); // CHANGE: negative sign for drag moment (as sign is handled during computation)
+		B_norm(5,1) = (u_0[1] * l3 * c_a1 * s_b1 - (M_idx_1 * s_a1 * c_b1)) * (alpha_max(1) - alpha_min(1)); // CHANGE: negative sign for drag moment (as sign is handled during computation)
+		B_norm(5,2) = ((-l3 * s_b2 - la(2)) * u_0[2] * c_a2 - (M_idx_2 * s_a2 * c_b2)) * (alpha_max(2) - alpha_min(2));
+		B_norm(5,3) = ((-l3 * s_b3 - la(3)) * u_0[3] * c_a3 - (M_idx_3 * s_a3 * c_b3)) * (alpha_max(3) - alpha_min(3));
+		B_norm(5,4) = ((l3 * s_a0 - la(0)) * u_0[0] * c_b0 - (M_idx_0 * c_a0 * s_b0)) * (beta_max(0) - beta_min(0)); // CHANGE: negative sign for drag moment (as sign is handled during computation)
+		B_norm(5,5) = ((l3 * s_a1 - la(1)) * u_0[1] * c_b1 - (M_idx_1 * c_a1 * s_b1)) * (beta_max(1) - beta_min(1)); // CHANGE: negative sign for drag moment (as sign is handled during computation)
+		B_norm(5,6) = (-u_0[2] * l3 * s_a2 * c_b2 - (M_idx_2 * c_a2 * s_b2)) * (beta_max(2) - beta_min(2));
+		B_norm(5,7) = (-u_0[3] * l3 * s_a3 * c_b3 - (M_idx_3 * c_a3 * s_b3)) * (beta_max(3) - beta_min(3));
+		
+	// inverse of wweight matrix
+		W_inv(0, 0) = (alpha_max(0) - alpha_min(0));
+		W_inv(1, 1) = (alpha_max(1) - alpha_min(1));
+		W_inv(2, 2) = (alpha_max(2) - alpha_min(2));
+		W_inv(3, 3) = (alpha_max(3) - alpha_min(3));
+		W_inv(4, 4) = (beta_max(0) - beta_min(0));
+		W_inv(5, 5) = (beta_max(1) - beta_min(1));
+		W_inv(6, 6) = (beta_max(2) - beta_min(2));
+		W_inv(7, 7) = (beta_max(3) - beta_min(3));
+		
+	// normalization
+		double delu_max[8];
+		double delu_min[8];
+				
+		delu_min[0] = alpha_min(0) - u_prev(0);
+		delu_max[0] = alpha_max(0) - u_prev(0);
+		delu_min[1] = alpha_min(1) - u_prev(1);
+		delu_max[1] = alpha_max(1) - u_prev(1);
+		delu_min[2] = alpha_min(2) - u_prev(2);
+		delu_max[2] = alpha_max(2) - u_prev(2);
+		delu_min[3] = alpha_min(3) - u_prev(3);
+		delu_max[3] = alpha_max(3) - u_prev(3);
+		delu_min[4] = beta_min(0) - u_prev(4);
+		delu_max[4] = beta_max(0) - u_prev(4);
+		delu_min[5] = beta_min(1) - u_prev(5);
+		delu_max[5] = beta_max(1) - u_prev(5);
+		delu_min[6] = beta_min(2) - u_prev(6);
+		delu_max[6] = beta_max(2) - u_prev(6);
+		delu_min[7] = beta_min(3) - u_prev(7);
+		delu_max[7] = beta_max(3) - u_prev(7);
+		
+	// normalized input vector
+		arma::mat B_norm_inv;
+		arma::vec delu_norm;
+		arma::vec delu;	
+		arma::vec u_scale_vec = arma::ones(8);
+		double u_scale;	
+		int c = 0;	
+				
+	//  nominal solution of normalized incremental inputs
+		bool not_start = (T1_0 == 0.0 && T2_0 == 0.0 && T3_0 == 0.0 && T4_0 == 0.0);
+		if (not_start) {
+                      	B_norm_inv = arma::zeros(8,6);
+              	}
+              	else {
+                     	B_norm_inv = arma::pinv(B_norm);
+              	}
+              	
+		delu_norm = B_norm_inv * del_F_M_b;
+		delu = W_inv * delu_norm;
+				
+	// check for saturation limits and find scaling factor 
+		// (reuse M_idx_0 to hold delu(idx) value in each loop)
+		for (idx = 0; idx < 8; idx++) {
+			M_idx_0 = delu(idx);
+			if (M_idx_0 < -error_lim) {
+				u_scale_vec(idx) = std::fmin(1.0, std::abs(delu_min[idx] / M_idx_0));
+			}
+			else if (M_idx_0 > error_lim) {
+				u_scale_vec(idx) = std::fmin(1.0, std::abs(delu_max[idx] / M_idx_0));
+			}
+			else {
+				u_scale_vec(idx) = 1.0;
+			}
+		}	
+					
+	// finding the minimum element in u_scale_vec
+		//(reuse M_idx_0 to hold u_scale_vec[idx+1] to compare with u_scale in each loop)
+		u_scale = u_scale_vec(0);
+		for (idx = 0; idx < 7; idx++) {
+			M_idx_0 = u_scale_vec(idx + 1);
+			if (u_scale > M_idx_0) {
+				u_scale = M_idx_0;
+			}
+		}
+		
+		//std::cout << "u_scale: " << u_scale  << std::endl;
+	// scale the output else deal with saturation
+		if (u_scale > error_lim) {
+			delu = delu * u_scale;
+		}
+		else {
+		// find index of zero elements in u_scale_vec
+			arma::uvec B_sat_idx = arma::find(u_scale_vec < error_lim);
+						
+			if (B_sat_idx.size() > 0 && B_sat_idx.size() < 7) {	
+			// remove saturated actuator(s) column (maintain rank by not zeroing the column)
+				for (idx = 0; idx < static_cast<int>(B_sat_idx.n_elem); idx++) {
+					B_norm.shed_col(B_sat_idx(idx)-c);
+					c++;
+					delu(B_sat_idx(idx)) = 0.0;
+				}
+			// new nominal solution of normalized incremental inputs
+				if (not_start) {
+	      				B_norm_inv = arma::zeros(B_norm.n_cols,6);
+				}
+				else {
+					B_norm_inv = arma::pinv(B_norm);
+		            	}
+				delu_norm = B_norm_inv * del_F_M_b;
+			// assign values to delu after saturation
+				c = 0;
+				for (idx = 0; idx < 8; idx++) {
+					if (c < static_cast<int>(B_sat_idx.size())) {
+						if (idx != static_cast<int>(B_sat_idx(c))) {
+							delu(idx) = delu_norm(idx-c);
+						}
+						else if (idx == static_cast<int>(B_sat_idx(c))) {	
+							delu(idx) = 0.0;
+							c++;
+						}
+					}
+					else {
+						delu(idx) = delu_norm(idx-c);
+					}
+				}
+			}
+			else {
+				delu = arma::zeros(8);
+			}
+		// de-normalize delu
+			delu = W_inv * delu;
+		}
+			
+	// find delu restoring
+		arma::mat B_aug = arma::zeros(14,8);   // (7,8)
+		B_aug.row(0) = B.row(0);
+		B_aug.row(1) = B.row(1);
+		B_aug.row(2) = B.row(2);
+		B_aug.row(3) = B.row(3);
+		B_aug.row(4) = B.row(4);
+		B_aug.row(5) = B.row(5);
+		B_aug(6,0) = 1.0;
+		B_aug(7,1) = 1.0;
+		B_aug(8,2) = 1.0;
+		B_aug(9,3) = 1.0;
+		B_aug(10,4) = 1.0;
+		B_aug(11,5) = 1.0;
+		B_aug(12,6) = 1.0;
+		B_aug(13,7) = 1.0;
+				
+		arma::mat B_aug_inv;
+				
+		arma::vec res_F_M = {0.0,0.0,0.0,0.0,0.0,0.0,-delu_out(0),-delu_out(1),-delu_out(2),-delu_out(3),-delu_out(4),-delu_out(5),-delu_out(6),-delu_out(7)};
+		
+		bool low_dout = (std::abs(delu_out(0)) < 1e-2 && std::abs(delu_out(1)) < 1e-2 && std::abs(delu_out(2)) < 1e-2 && std::abs(delu_out(3)) < 1e-2 && std::abs(delu_out(4)) < 1e-2 && std::abs(delu_out(5)) < 1e-2 && std::abs(delu_out(6)) < 1e-2 && std::abs(delu_out(7)) < 1e-2);
+				
+	// find inverse of augmented matrix
+		if (not_start || low_dout) {
+              		B_aug_inv = arma::zeros(8,14);  // (8,7)
+      		}
+      		else {
+         	 	B_aug_inv = arma::pinv(B_aug);
+      		}
+	// delu restoring
+		delu_res = B_aug_inv * res_F_M;
+				
+		/*std::cout << "u_prev: " << u_prev << std::endl;
+		std::cout << "delu_max: " << delu_max[0] << std::endl;
+		std::cout << "" << delu_max[1] << std::endl;
+		std::cout << "" << delu_max[2] << std::endl;
+		std::cout << "" << delu_max[3] << std::endl;
+		std::cout << "" << delu_max[4] << std::endl;
+		std::cout << "" << delu_max[5] << std::endl;
+		std::cout << "" << delu_max[6] << std::endl;
+		std::cout << "" << delu_max[7] << std::endl;
+		std::cout << "delu_min: " << delu_min[0] << std::endl;
+		std::cout << "" << delu_min[1] << std::endl;
+		std::cout << "" << delu_min[2] << std::endl;
+		std::cout << "" << delu_min[3] << std::endl;
+		std::cout << "" << delu_min[4] << std::endl;
+		std::cout << "" << delu_min[5] << std::endl;
+		std::cout << "" << delu_min[6] << std::endl;
+		std::cout << "" << delu_min[7] << std::endl;
+		//std::cout << "delu_res: " << delu_res << std::endl;*/
+				
+	// find K_max 
+		// (reuse M_idx_0 to hold delu_res(idx) value in each loop)
+		arma::vec K_max_vec = arma::ones(8);
+	
+		arma::vec delu_res_step = delu_res - delu_res_prev;
+		//std::cout << "delu_res_step: " << delu_res_step << std::endl;
+		for (idx = 0; idx < 8; idx++) {
+			if (delu_res_step(idx) < 0.0 && delu_min[idx] >= -error_lim) {
+				K_max_vec(idx) = 0.0;
+			}
+			else if (delu_res_step(idx) >= 0.0 && delu_max[idx] <= error_lim) {
+				K_max_vec(idx) = 0.0;
+			}
+			else {
+				K_max_vec(idx) = 1.0;
+			}
+		}
+					
+	// total delu including restoring			
+		for (idx = 0; idx < 8; idx++) {	
+			delu_r(idx) = (K_max_vec(idx) * delu_res(idx)) + delu_out(idx);
+		}
+	
+	// buffer for calculating rolling average delu_r
+		delu_r_0.pop_front();
+		delu_r_1.pop_front();
+		delu_r_2.pop_front();
+		delu_r_3.pop_front();
+		delu_r_4.pop_front();
+		delu_r_5.pop_front();
+		delu_r_6.pop_front();
+		delu_r_7.pop_front();
+			
+		delu_r_0.push_back(delu_r(0));
+		delu_r_1.push_back(delu_r(1));
+		delu_r_2.push_back(delu_r(2));
+		delu_r_3.push_back(delu_r(3));
+		delu_r_4.push_back(delu_r(4));
+		delu_r_5.push_back(delu_r(5));
+		delu_r_6.push_back(delu_r(6));
+		delu_r_7.push_back(delu_r(7));
+		
+		/*delu_r_avg0 = (delu_r_0[0]+delu_r_0[1]+delu_r_0[2]+delu_r_0[3]+delu_r_0[4]+delu_r_0[5]+delu_r_0[6]+delu_r_0[7]+delu_r_0[8]+delu_r_0[9])/delu_r_0.size();
+		delu_r_avg1 = (delu_r_1[0]+delu_r_1[1]+delu_r_1[2]+delu_r_1[3]+delu_r_1[4]+delu_r_1[5]+delu_r_1[6]+delu_r_1[7]+delu_r_1[8]+delu_r_1[9])/delu_r_1.size();
+		delu_r_avg2 = (delu_r_2[0]+delu_r_2[1]+delu_r_2[2]+delu_r_2[3]+delu_r_2[4]+delu_r_2[5]+delu_r_2[6]+delu_r_2[7]+delu_r_2[8]+delu_r_2[9])/delu_r_2.size();
+		delu_r_avg3 = (delu_r_3[0]+delu_r_3[1]+delu_r_3[2]+delu_r_3[3]+delu_r_3[4]+delu_r_3[5]+delu_r_3[6]+delu_r_3[7]+delu_r_3[8]+delu_r_3[9])/delu_r_3.size();
+		delu_r_avg4 = (delu_r_4[0]+delu_r_4[1]+delu_r_4[2]+delu_r_4[3]+delu_r_4[4]+delu_r_4[5]+delu_r_4[6]+delu_r_4[7]+delu_r_4[8]+delu_r_4[9])/delu_r_4.size();
+		delu_r_avg5 = (delu_r_5[0]+delu_r_5[1]+delu_r_5[2]+delu_r_5[3]+delu_r_5[4]+delu_r_5[5]+delu_r_5[6]+delu_r_5[7]+delu_r_5[8]+delu_r_5[9])/delu_r_5.size();
+		delu_r_avg6 = (delu_r_6[0]+delu_r_6[1]+delu_r_6[2]+delu_r_6[3]+delu_r_6[4]+delu_r_6[5]+delu_r_6[6]+delu_r_6[7]+delu_r_6[8]+delu_r_6[9])/delu_r_6.size();
+		delu_r_avg7 = (delu_r_7[0]+delu_r_7[1]+delu_r_7[2]+delu_r_7[3]+delu_r_7[4]+delu_r_7[5]+delu_r_7[6]+delu_r_7[7]+delu_r_7[8]+delu_r_7[9])/delu_r_7.size();*/
+		/*delu_r_avg0 = (delu_r_0[0]+delu_r_0[1]+delu_r_0[2]+delu_r_0[3]+delu_r_0[4])/delu_r_0.size();
+		delu_r_avg1 = (delu_r_1[0]+delu_r_1[1]+delu_r_1[2]+delu_r_1[3]+delu_r_1[4])/delu_r_1.size();
+		delu_r_avg2 = (delu_r_2[0]+delu_r_2[1]+delu_r_2[2]+delu_r_2[3]+delu_r_2[4])/delu_r_2.size();
+		delu_r_avg3 = (delu_r_3[0]+delu_r_3[1]+delu_r_3[2]+delu_r_3[3]+delu_r_3[4])/delu_r_3.size();
+		delu_r_avg4 = (delu_r_4[0]+delu_r_4[1]+delu_r_4[2]+delu_r_4[3]+delu_r_4[4])/delu_r_4.size();
+		delu_r_avg5 = (delu_r_5[0]+delu_r_5[1]+delu_r_5[2]+delu_r_5[3]+delu_r_5[4])/delu_r_5.size();
+		delu_r_avg6 = (delu_r_6[0]+delu_r_6[1]+delu_r_6[2]+delu_r_6[3]+delu_r_6[4])/delu_r_6.size();
+		delu_r_avg7 = (delu_r_7[0]+delu_r_7[1]+delu_r_7[2]+delu_r_7[3]+delu_r_7[4])/delu_r_7.size();*/
+		
+		delu_r_avg0 = (delu_r_0[0]+delu_r_0[1]+delu_r_0[2])/delu_r_0.size();
+		delu_r_avg1 = (delu_r_1[0]+delu_r_1[1]+delu_r_1[2])/delu_r_1.size();
+		delu_r_avg2 = (delu_r_2[0]+delu_r_2[1]+delu_r_2[2])/delu_r_2.size();
+		delu_r_avg3 = (delu_r_3[0]+delu_r_3[1]+delu_r_3[2])/delu_r_3.size();
+		delu_r_avg4 = (delu_r_4[0]+delu_r_4[1]+delu_r_4[2])/delu_r_4.size();
+		delu_r_avg5 = (delu_r_5[0]+delu_r_5[1]+delu_r_5[2])/delu_r_5.size();
+		delu_r_avg6 = (delu_r_6[0]+delu_r_6[1]+delu_r_6[2])/delu_r_6.size();
+		delu_r_avg7 = (delu_r_7[0]+delu_r_7[1]+delu_r_7[2])/delu_r_7.size();
+	
+	// final absolute control output (including restoring)
+		u(0) = u_0[4] + delu_r_avg0;
+		u(1) = u_0[5] + delu_r_avg1;
+		u(2) = u_0[6] + delu_r_avg2;
+		u(3) = u_0[7] + delu_r_avg3;
+		u(4) = u_0[8] + delu_r_avg4;
+		u(5) = u_0[9] + delu_r_avg5;
+		u(6) = u_0[10] + delu_r_avg6;
+		u(7) = u_0[11] + delu_r_avg7;		
+		
+		for (idx = 0; idx < 8; idx++) {
+		// new lines of code added to deal with saturation
+		// alpha saturation (idx: 0 to 3)
+		 	if (idx < 4) {
+				if (u(idx) > alpha_max(idx)) {
+					u(idx) = alpha_max(idx);
+				}
+				else if (u(idx) < alpha_min(idx)) {
+					u(idx) = alpha_min(idx);
+				}
+			}
+		// beta saturation (idx: 4 to 7)
+			else if (idx > 3 && idx < 8) {
+				if (u(idx) > beta_max(idx - 4)) {
+					u(idx) = beta_max(idx - 4);
+				}
+				else if (u(idx) < beta_min(idx - 4)) {
+					u(idx) = beta_min(idx - 4);
+				}
+			}
+		}	
+				
+	// store previous restoring delu
+		delu_res_prev = delu_res;
+		u_prev = u;
+		std::cout << timestamp << " " << u(0) << " " << u(1) << " " << u(2) << " " << u(3) << " " << u(4) << " " << u(5) << " " << u(6) << " " << u(7) << std::endl;
+		angles_vect.poses[0].position.x = u(0);
+		angles_vect.poses[0].position.y = u(1);
+	    angles_vect.poses[0].position.z = u(2);
+	       
+	    angles_vect.poses[0].orientation.x = u(3);
+	    angles_vect.poses[0].orientation.y = u(4);
+	    angles_vect.poses[0].orientation.z = u(5);
+	    	
+	    angles_vect.poses[1].position.x = u(6);
+	    angles_vect.poses[1].position.y = u(7);
+	    
+	    angles_vect.poses[1].position.z = rc_ks;
+	    	
+	        /*std::cout << "INDI script values " << std::endl;
+		  std::cout << "==================" << std::endl;
+		  std::cout << "u(0): " << angles_vect.poses[0].position.x  << std::endl;
+		  std::cout << "u(1): " << angles_vect.poses[0].position.y  << std::endl;
+		  std::cout << "u(2): " << angles_vect.poses[0].position.z  << std::endl;
+		  std::cout << "u(3): " << angles_vect.poses[0].orientation.x  << std::endl;
+		  std::cout << "u(4): " << angles_vect.poses[0].orientation.y  << std::endl;
+		  std::cout << "u(5): " << angles_vect.poses[0].orientation.z  << std::endl;
+		  std::cout << "u(6): " << angles_vect.poses[1].position.x  << std::endl;
+		  std::cout << "u(7): " << angles_vect.poses[1].position.y  << std::endl;*/
+	    
+	    	output_publisher_->publish(angles_vect); 
+	    	
+		//std::cout << "u_prev: " << u_prev << std::endl;
+		//std::cout << "K_max_vec" << K_max_vec	 << std::endl;
+		//std::cout << "K_opt_vec" << K_opt_vec << std::endl;
+		/*std::cout << "u_0: " << u_0[4] << std::endl;
+		std::cout << "" << u_0[5] << std::endl;
+		std::cout << "" << u_0[6] << std::endl;
+		std::cout << "" << u_0[7] << std::endl;
+		std::cout << "" << u_0[8] << std::endl;
+		std::cout << "" << u_0[9] << std::endl;
+		std::cout << "" << u_0[10] << std::endl;
+		std::cout << "" << u_0[11] << std::endl;
+		std::cout << "u_after: " << u << std::endl;
+		std::cout << "delu_r: " << delu_r << std::endl;
+		std::cout << "delu_res: " << delu_res << std::endl;
+		std::cout << "delu_out: " << delu_out << std::endl;
+		std::cout << "F_M" << B*u << std::endl;
+		std::cout << "del_F_M_b: " << del_F_M_b << std::endl;*/
+}
+
+//@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+//@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+//@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+int main(int argc, char *argv[])
+{ 
+    std::cout << "Starting allocation node..." << std::endl;
+    setvbuf(stdout, NULL, _IONBF, BUFSIZ);
+    rclcpp::init(argc, argv);
+    // spin the node   
+    rclcpp::spin(std::make_shared<OutputAdvertiser>());
+    rclcpp::shutdown();
+    return 0;
+}
