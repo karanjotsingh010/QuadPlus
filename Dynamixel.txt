@@ -1,0 +1,68 @@
+STANDARDIZE USB PORT NAME: /dev/ttyUSB* to /dev/Dyna0
+
+Check USB port number: ls /dev/tty*, answer would be /dev/ttyUSB0 or /dev/ttyUSB1
+For controllers answer could be: /dev/ttyACM*
+USB info: usb-devices
+Enter root folder: sudo nautilus
+Rules folder path: /etc/udev/rules.d
+Create file: 10-local.rules
+Define "idProduct" & "idVendor" to have a fixed USB port name.
+e.g. ACTION=="add", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6014", SYMLINK+="Dyna0"
+
+
+USB PERMISSIONS
+sudo chmod 777 /dev/Dyna0
+sudo chmod 777 /dev/ttyUSB0
+
+777 allows all actions for all users- read, write and execute.
+666 allows only read and write, no execution.
+
+GIT WORKSPACE DOWNLOAD 
+(https://emanual.robotis.com/docs/en/software/dynamixel/dynamixel_sdk/download/#repository)
+mkdir -p ~/robotis_ws/src
+git clone -b $ROS_DISTRO-devel https://github.com/ROBOTIS-GIT/DynamixelSDK.git
+
+BUILD WORKSPACE
+cd robotis_ws
+colcon build --symlink-install
+
+EXECUTION OF DYNAMIXEL CONTROL CODE
+Go to the workspace: cd dev_ws
+Source the overlay: . install/local_setup.bash
+Run the node: ros2 run dynamixel_sdk_examples read_write_node
+Set the position: ros2 topic pub -1 /set_position dynamixel_sdk_custom_interfaces/msg/SetPosition "{id: 2, position: 2048}"
+
+ADDING NEW SOURCE CODE
+Modify the CMakelists.txt file besides the source folder.
+Add executable:
+add_executable(node_name src/source_code.cpp)
+ament_target_dependencies(executable_name
+  dependencies
+)
+
+Install node/s:
+install(TARGETS 
+  [node-names]
+  DESTINATION lib/${PROJECT_NAME}
+)
+
+Add the new class (node) into the header file:
+Define SyncReadWriteNode into read_write_node.hpp
+Include the new message (sync_set_position.hpp) and service (sync_get_position.hpp) header files into the header file: read_write_node.hpp and source code: sync_read_write_node.cpp.
+
+RUN THE FINAL EXECUTABLE
+Terminal 1:
+cd dev_ws
+cd robotis_ws
+. install/local_setup.bash
+ros2 run dynamixel_sdk_examples sync_read_write_node
+ros2 run dynamixel_sdk_examples pub_sync_write_node
+
+Terminal 2:
+cd px4_ros_com_ros2
+cd robotis_ws
+cd dev_ws
+. install/local_setup.bash
+ros2 topic pub -1 /sync_set_position dynamixel_sdk_custom_interfaces/msg/SyncSetPosition "{id1: 1, id2: 2, id3: 3, id4: 4, id5: 5, id6: 6, id7: 7, id8: 8, position1: 3073, position2: 2048, position3: 3073, position4: 2048, position5: 3073, position6: 2048, position7: 3073, position8: 2048}"
+
+ros2 topic pub -1 /sync_set_position dynamixel_sdk_custom_interfaces/msg/SyncSetPosition "{id1: 1, id2: 2, id3: 3, id4: 4, id5: 5, id6: 6, id7: 7, id8: 8, position1: 2700, position2: 2700, position3: 2700, position4: 2700, position5: 2700, position6: 2700, position7: 2700, position8: 2700}"
