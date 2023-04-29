@@ -1,0 +1,18 @@
+# Messages
+uint8 id1
+uint8 id2
+uint8 id3
+uint8 id4
+uint8 id5
+uint8 id6
+uint8 id7
+uint8 id8
+
+int32 position1
+int32 position2
+int32 position3
+int32 position4
+int32 position5
+int32 position6
+int32 position7
+int32 position8
