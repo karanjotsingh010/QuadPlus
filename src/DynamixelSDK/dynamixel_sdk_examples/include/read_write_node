@@ -1,0 +1,59 @@
+
+#ifndef READ_WRITE_NODE_HPP_
+#define READ_WRITE_NODE_HPP_
+
+#include <chrono>
+#include <cstdio>
+#include <memory>
+#include <string>
+
+#include "rclcpp/rclcpp.hpp"
+#include "rcutils/cmdline_parser.h"
+#include "dynamixel_sdk/dynamixel_sdk.h"
+#include "dynamixel_sdk_custom_interfaces/msg/set_position.hpp"
+#include "dynamixel_sdk_custom_interfaces/srv/get_position.hpp"
+#include "dynamixel_sdk_custom_interfaces/msg/sync_set_position.hpp"
+#include "dynamixel_sdk_custom_interfaces/srv/sync_get_position.hpp"
+
+using namespace std::chrono_literals;
+
+class ReadWriteNode : public rclcpp::Node
+{
+public:
+  using SetPosition = dynamixel_sdk_custom_interfaces::msg::SetPosition;
+  using GetPosition = dynamixel_sdk_custom_interfaces::srv::GetPosition;
+
+  ReadWriteNode();
+  virtual ~ReadWriteNode();
+
+private:
+  rclcpp::Subscription<SetPosition>::SharedPtr set_position_subscriber_;
+  rclcpp::Service<GetPosition>::SharedPtr get_position_server_;
+
+  int present_position;
+};
+
+class SyncReadWriteNode : public rclcpp::Node
+{
+public:
+  using SyncSetPosition = dynamixel_sdk_custom_interfaces::msg::SyncSetPosition;
+  using SyncGetPosition = dynamixel_sdk_custom_interfaces::srv::SyncGetPosition;
+
+  SyncReadWriteNode();
+  virtual ~SyncReadWriteNode();
+
+private:
+  rclcpp::Subscription<SyncSetPosition>::SharedPtr set_position_subscriber_;
+  rclcpp::Service<SyncGetPosition>::SharedPtr get_position_server_;
+
+  int present_position1;
+  int present_position2;
+  int present_position3;
+  int present_position4;
+  int present_position5;
+  int present_position6;
+  int present_position7;
+  int present_position8;
+};
+
+#endif  // READ_WRITE_NODE_HPP_
