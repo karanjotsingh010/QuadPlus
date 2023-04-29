@@ -1,0 +1,53 @@
+INSTALL FAST DDS (https://docs.px4.io/master/en/dev_setup/fast-dds-installation.html)
+Install Java 11.
+Install Gradle 6.3 via sdkman.
+Install foonathan memory vendor in home folder.
+Clone FastDDS in home folder and build it.
+Clone Fast-RTPS-Gen in in home folder and build it.
+Install colcon.
+
+
+CREATE ROS2 WORKSPACE FOR PX4 (https://docs.px4.io/master/en/ros/ros2_comm.html#install-fast-dds)
+Create workspace px4_ros_com_ros2
+Clone the px4_ros_com and px4_msg folder into the src folder in the workspace.
+
+px4_ros_com uses micro_RTPS agent in PX4-Autopilot.
+Clone the PX4-Autopilot in the home folder: git clone https://github.com/PX4/PX4-Autopilot.git --recursive
+Install PX4-Autopilot: bash ./PX4-Autopilot/Tools/setup/ubuntu.sh
+
+Build the workspace:
+cd ~/px4_ros_com_ros2/src/px4_ros_com/scripts
+source build_ros2_workspace.bash
+
+Check the installation:
+cd ~/PX4-Autopilot
+make px4_sitl_rtps gazebo
+
+Start micrortps_agent:
+source ~/px4_ros_com_ros2/install/setup.bash
+micrortps_agent -t UDP
+
+Start a listener:
+source ~/px4_ros_com_ros2/install/setup.bash
+ros2 launch px4_ros_com sensor_combined_listener.launch.py
+
+source ~/px4_ros_com_ros2/install/setup.bash
+ros2 launch px4_ros_com offboard_control_dyna.launch.py
+
+ADD MESSAGE
+Make changes to the file 
+"urtps_bridge_topics.yaml" in the folder ~/PX4-Autopilot/msg/tools.
+Run the code in the terminal at the base folder location "~/PX4-Autopilot/msg/tools python3 uorb_to_ros_urtps_topics.py -i urtps_bridge_topics.yaml -o ~/px4_ros_com_ros2/src/px4_ros_com/templates/urtps_bridge_topics.yaml"
+
+If the message is not in the CMakeLists then add into the list: ~/PX4-Autopilot/msg CMakeLists.txt.
+Include the message header file into the .cpp file of the listener.
+Look for the relevant header files in the folder ~/px4_ros_com_ros2/install/px4_msgs/include/px4_msgs_msg
+
+Clean all bash by running the file at the base folder location:
+cd ~/px4_ros_com_ros2/src/px4_ros_com/scripts 
+source clean_all.bash
+
+Build the workspace again:
+cd ~/px4_ros_com_ros2/src/px4_ros_com/scripts
+source build_ros2_workspace.bash
+
